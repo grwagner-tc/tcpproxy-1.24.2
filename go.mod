@@ -1,4 +1,4 @@
-module github.com/inetaf/tcpproxy
+module github.com/madman22/tcpproxy
 
 go 1.16
 

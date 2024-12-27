@@ -60,6 +60,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -69,11 +70,15 @@ import (
 // The order that routes are added in matters; each is matched in the order
 // registered.
 type Proxy struct {
-	configs map[string]*config // ip:port => config
+	configmux sync.RWMutex
+	configs   map[string]*config // ip:port => config
 
-	lns   []net.Listener
+	//lns   []net.Listener
+	lns map[string]net.Listener
+
 	donec chan struct{} // closed before err
 	err   error         // any error from listening
+	errc  chan error
 
 	// ListenFunc optionally specifies an alternate listen
 	// function. If nil, net.Dial is used.
@@ -129,8 +134,24 @@ func (p *Proxy) configFor(ipPort string) *config {
 }
 
 func (p *Proxy) addRoute(ipPort string, r route) {
+	p.configmux.Lock()
+	defer p.configmux.Unlock()
+	if p.lns == nil {
+		p.lns = make(map[string]net.Listener)
+	}
+
 	cfg := p.configFor(ipPort)
 	cfg.routes = append(cfg.routes, r)
+
+	if p.donec != nil {
+		ln, err := p.netListen()("tcp", ipPort)
+		if err != nil {
+			delete(p.configs, ipPort)
+			return
+		}
+		p.lns[ipPort] = ln
+		go p.serveListener(p.errc, ln, cfg.routes)
+	}
 }
 
 // AddRoute appends an always-matching route to the ipPort listener,
@@ -142,6 +163,29 @@ func (p *Proxy) addRoute(ipPort string, r route) {
 // The ipPort is any valid net.Listen TCP address.
 func (p *Proxy) AddRoute(ipPort string, dest Target) {
 	p.addRoute(ipPort, fixedTarget{dest})
+}
+
+func (p *Proxy) RemoveRoute(ipPort string) {
+	p.configmux.Lock()
+	defer p.configmux.Unlock()
+	if _, ok := p.configs[ipPort]; !ok {
+		return
+	}
+
+	delete(p.configs, ipPort)
+	if p.donec != nil {
+		if ln, ok := p.lns[ipPort]; ok {
+			ln.Close()
+			delete(p.lns, ipPort)
+		}
+	}
+}
+
+func (p *Proxy) HasRoute(ipPort string) bool {
+	p.configmux.RLock()
+	defer p.configmux.RUnlock()
+	_, ok := p.configs[ipPort]
+	return ok
 }
 
 type fixedTarget struct {
@@ -175,7 +219,14 @@ func (p *Proxy) Close() error {
 	for _, c := range p.lns {
 		c.Close()
 	}
+	close(p.donec)
 	return nil
+}
+
+func (p *Proxy) WithErrorChannel(errc chan error) {
+	p.configmux.Lock()
+	defer p.configmux.Unlock()
+	p.errc = errc
 }
 
 // Start creates a TCP listener for each unique ipPort from the
@@ -185,22 +236,32 @@ func (p *Proxy) Close() error {
 // If it returns a non-nil error, any successfully opened listeners
 // are closed.
 func (p *Proxy) Start() error {
+	p.configmux.Lock()
+	defer p.configmux.Unlock()
+	if p.lns == nil {
+		p.lns = make(map[string]net.Listener)
+	}
+
 	if p.donec != nil {
 		return errors.New("already started")
 	}
 	p.donec = make(chan struct{})
-	errc := make(chan error, len(p.configs))
-	p.lns = make([]net.Listener, 0, len(p.configs))
+	if p.errc == nil {
+		errc := make(chan error, len(p.configs))
+		p.errc = errc
+	}
+	//p.lns = make([]net.Listener, 0, len(p.configs))
 	for ipPort, config := range p.configs {
 		ln, err := p.netListen()("tcp", ipPort)
 		if err != nil {
 			p.Close()
 			return err
 		}
-		p.lns = append(p.lns, ln)
-		go p.serveListener(errc, ln, config.routes)
+		//p.lns = append(p.lns, ln)
+		p.lns[ipPort] = ln
+		go p.serveListener(p.errc, ln, config.routes)
 	}
-	go p.awaitFirstError(errc)
+	//go p.awaitFirstError(errc)
 	return nil
 }
 
