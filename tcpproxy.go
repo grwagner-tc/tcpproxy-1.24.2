@@ -146,7 +146,7 @@ func (p *Proxy) addRoute(ipPort string, r route) {
 	if p.donec != nil {
 		ln, err := p.netListen()("tcp", ipPort)
 		if err != nil {
-			delete(p.configs, ipPort)
+			//delete(p.configs, ipPort)
 			return
 		}
 		p.lns[ipPort] = ln
